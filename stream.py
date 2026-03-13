@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import threading
@@ -70,30 +71,78 @@ async def post_to_n8n(payload: dict):
 def make_handler(account: dict):
     async def trade_update_handler(data):
         order = data.order
+
+        def safe(val):
+            """Serialize any value to a JSON-safe string or primitive."""
+            if val is None:
+                return None
+            if hasattr(val, "value"):       # Enum → string
+                return val.value
+            if hasattr(val, "isoformat"):   # datetime → ISO string
+                return val.isoformat()
+            return str(val)
+
         payload = {
-            # Account identity
-            "account_label": account["label"],
-            "account_name": account["name"],
-            "is_paper": account["is_paper"],
-            # Trade event
-            "event": data.event,
-            "timestamp": str(data.timestamp),
-            "order_id": str(order.id),
-            "client_order_id": str(order.client_order_id),
-            "symbol": order.symbol,
-            "side": order.side.value,
-            "type": order.type.value,
-            "qty": str(order.qty),
-            "filled_qty": str(order.filled_qty),
-            "filled_avg_price": str(order.filled_avg_price),
-            "status": order.status.value,
-            "time_in_force": order.time_in_force.value,
-            "limit_price": str(order.limit_price),
-            "stop_price": str(order.stop_price),
+            # ── Account identity ──────────────────────────────────────────
+            "account_label":        account["label"],
+            "account_name":         account["name"],
+            "is_paper":             account["is_paper"],
+
+            # ── TradeUpdate top-level fields ──────────────────────────────
+            "event":                safe(data.event),
+            "timestamp":            safe(data.timestamp),
+            "execution_id":         safe(getattr(data, "execution_id", None)),
+            "position_qty":         safe(getattr(data, "position_qty", None)),
+            "price":                safe(getattr(data, "price", None)),
+            "qty":                  safe(getattr(data, "qty", None)),   # event-level fill qty
+
+            # ── Order identity ────────────────────────────────────────────
+            "order_id":             safe(order.id),
+            "client_order_id":      safe(order.client_order_id),
+            "asset_id":             safe(getattr(order, "asset_id", None)),
+            "asset_class":          safe(getattr(order, "asset_class", None)),
+            "symbol":               safe(order.symbol),
+
+            # ── Order parameters ──────────────────────────────────────────
+            "side":                 safe(order.side),
+            "type":                 safe(order.type),
+            "order_class":          safe(getattr(order, "order_class", None)),
+            "time_in_force":        safe(order.time_in_force),
+            "order_qty":            safe(order.qty),                    # original order qty
+            "notional":             safe(getattr(order, "notional", None)),
+            "limit_price":          safe(order.limit_price),
+            "stop_price":           safe(order.stop_price),
+            "trail_price":          safe(getattr(order, "trail_price", None)),
+            "trail_percent":        safe(getattr(order, "trail_percent", None)),
+            "hwm":                  safe(getattr(order, "hwm", None)),
+            "extended_hours":       safe(getattr(order, "extended_hours", None)),
+
+            # ── Order fill info ───────────────────────────────────────────
+            "status":               safe(order.status),
+            "filled_qty":           safe(order.filled_qty),
+            "filled_avg_price":     safe(order.filled_avg_price),
+
+            # ── Order timestamps ──────────────────────────────────────────
+            "created_at":           safe(getattr(order, "created_at", None)),
+            "updated_at":           safe(getattr(order, "updated_at", None)),
+            "submitted_at":         safe(getattr(order, "submitted_at", None)),
+            "filled_at":            safe(getattr(order, "filled_at", None)),
+            "expired_at":           safe(getattr(order, "expired_at", None)),
+            "canceled_at":          safe(getattr(order, "canceled_at", None)),
+            "failed_at":            safe(getattr(order, "failed_at", None)),
+            "replaced_at":          safe(getattr(order, "replaced_at", None)),
+
+            # ── Order replace chain ───────────────────────────────────────
+            "replaced_by":          safe(getattr(order, "replaced_by", None)),
+            "replaces":             safe(getattr(order, "replaces", None)),
+
+            # ── Legs (bracket/OCO orders) ─────────────────────────────────
+            "legs":                 [safe(leg) for leg in (order.legs or [])] if getattr(order, "legs", None) else [],
         }
-        log.info(
-            f"[{account['label']}] [{data.event.upper()}] {order.symbol} qty={order.qty} @ {order.filled_avg_price}"
-        )
+
+        # Structured JSON log — full payload visible in stdout / n8n log scraper
+        log.info(json.dumps(payload, default=str))
+
         await post_to_n8n(payload)
 
     return trade_update_handler
