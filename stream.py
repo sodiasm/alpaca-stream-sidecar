@@ -2,10 +2,8 @@ import asyncio
 import json
 import logging
 import os
-import sqlite3
 import threading
 import time
-from datetime import datetime
 from http.server import BaseHTTPRequestHandler, HTTPServer
 
 import aiohttp
@@ -36,66 +34,6 @@ def _get_account_lock(label: str) -> asyncio.Lock:
     return _account_locks[label]
 
 
-# ── Dead-letter queue (SQLite) ─────────────────────────────────────────────────
-DLQ_PATH = os.getenv("DLQ_PATH", "/data/dlq.sqlite3")
-
-
-def _dlq_init():
-    """Create the DLQ table if it does not already exist."""
-    os.makedirs(os.path.dirname(DLQ_PATH), exist_ok=True)
-    with sqlite3.connect(DLQ_PATH) as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS failed_events (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                account     TEXT    NOT NULL,
-                event_time  TEXT    NOT NULL,
-                payload     TEXT    NOT NULL,
-                last_error  TEXT,
-                attempts    INTEGER DEFAULT 0,
-                created_at  TEXT    DEFAULT (datetime('now')),
-                resolved    INTEGER DEFAULT 0
-            )
-        """)
-        conn.commit()
-    log.info(f"DLQ initialised at {DLQ_PATH}")
-
-
-def _dlq_write(account_label: str, payload: dict, error: str):
-    """Persist a failed payload to the dead-letter queue."""
-    try:
-        with sqlite3.connect(DLQ_PATH) as conn:
-            conn.execute(
-                "INSERT INTO failed_events "
-                "(account, event_time, payload, last_error, attempts) VALUES (?,?,?,?,?)",
-                (
-                    account_label,
-                    payload.get("timestamp", datetime.utcnow().isoformat()),
-                    json.dumps(payload, default=str),
-                    str(error),
-                    WEBHOOK_MAX_RETRIES,
-                ),
-            )
-            conn.commit()
-        log.warning(
-            f"[DLQ] Stored failed event for [{account_label}] — "
-            f"{payload.get('event')} {payload.get('symbol')}"
-        )
-    except Exception as db_err:
-        log.error(f"[DLQ] Could not write to SQLite: {db_err}")
-
-
-def dlq_pending_count() -> int:
-    """Return count of unresolved DLQ entries (used by health endpoint)."""
-    try:
-        with sqlite3.connect(DLQ_PATH) as conn:
-            row = conn.execute(
-                "SELECT COUNT(*) FROM failed_events WHERE resolved=0"
-            ).fetchone()
-            return row[0] if row else 0
-    except Exception:
-        return -1
-
-
 # ── POST to n8n with retry + stagger ──────────────────────────────────────────
 async def post_to_n8n(payload: dict):
     """
@@ -103,7 +41,7 @@ async def post_to_n8n(payload: dict):
       • per-account serialisation lock (no concurrent bursts for same account)
       • minimum inter-call stagger (WEBHOOK_MIN_INTERVAL_S)
       • exponential-backoff retry up to WEBHOOK_MAX_RETRIES attempts
-      • dead-letter queue on final failure (no event is silently lost)
+      • ERROR log on final failure (no silent drop, no volume required)
     """
     label = payload.get("account_label", "unknown")
     lock = _get_account_lock(label)
@@ -145,12 +83,11 @@ async def post_to_n8n(payload: dict):
                 log.info(f"[{label}] Retrying in {backoff:.1f}s …")
                 await asyncio.sleep(backoff)
 
-        # All retries exhausted → DLQ ────────────────────────────────────
+        # All retries exhausted — log the full payload so nothing is invisible
         log.error(
-            f"[{label}] Webhook failed after {WEBHOOK_MAX_RETRIES} attempts. "
-            f"Sending to dead-letter queue. Last error: {last_error}"
+            f"[{label}] Webhook permanently failed after {WEBHOOK_MAX_RETRIES} attempts. "
+            f"Last error: {last_error} | payload: {json.dumps(payload, default=str)}"
         )
-        _dlq_write(label, payload, str(last_error))
 
 
 # ── Parse accounts from env ────────────────────────────────────────────────────
@@ -282,8 +219,7 @@ def run_stream(account: dict):
 # ── Health check server ────────────────────────────────────────────────────────
 class HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
-        pending = dlq_pending_count()
-        body = json.dumps({"status": "ok", "dlq_pending": pending}).encode()
+        body = json.dumps({"status": "ok"}).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self.end_headers()
@@ -301,7 +237,6 @@ def run_health_server():
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 def main():
-    _dlq_init()
     accounts = load_accounts()
 
     # Health server in background
