@@ -10,7 +10,7 @@ A lightweight Python sidecar service that connects to the **Alpaca Trading WebSo
 Alpaca WebSocket
       ↓
  alpaca-stream (this service)
-      ↓  POST /webhook/alpaca-trades
+      ↓  POST /webhook/alpaca-trades  (retry + stagger)
     n8n service
       ↓
  Your workflow logic (alerts, logging, order management...)
@@ -28,6 +28,8 @@ Both services should be deployed in the **same Zeabur project** so the sidecar c
 - 🩺 **Health check HTTP server** — required for Zeabur to confirm the service is alive
 - 📦 **Binary frame support** — uses `alpaca-py`'s native `TradingStream` which handles MessagePack encoding
 - 🔒 **No secrets in code** — all credentials loaded from environment variables
+- ♻️ **Retry with exponential backoff** — up to `WEBHOOK_MAX_RETRIES` attempts before logging failure
+- 🚦 **Staggered webhook calls** — per-account lock + minimum interval prevents burst flooding
 
 ---
 
@@ -50,11 +52,15 @@ Copy `.env.example` to `.env` for local development. On Zeabur, set these in the
 
 ### Global Variables
 
-| Variable | Required | Description |
-|---|---|---|
-| `N8N_WEBHOOK_URL` | ✅ | Full URL of your n8n Webhook Trigger node |
-| `ACCOUNTS` | ✅ | Comma-separated account labels e.g. `acc1,acc2` |
-| `PORT` | ❌ | Health check server port (default: `8080`) |
+| Variable | Required | Default | Description |
+|---|---|---|---|
+| `N8N_WEBHOOK_URL` | ✅ | — | Full URL of your n8n Webhook Trigger node |
+| `ACCOUNTS` | ✅ | — | Comma-separated account labels e.g. `acc1,acc2` |
+| `PORT` | ❌ | `8080` | Health check server port |
+| `WEBHOOK_MAX_RETRIES` | ❌ | `3` | Max POST attempts before logging failure |
+| `WEBHOOK_RETRY_BASE_S` | ❌ | `1.0` | Backoff base in seconds (doubles each attempt) |
+| `WEBHOOK_TIMEOUT_S` | ❌ | `5.0` | Per-request HTTP timeout in seconds |
+| `WEBHOOK_MIN_INTERVAL_S` | ❌ | `0.25` | Minimum gap between consecutive calls per account |
 
 ### Per-Account Variables
 
@@ -74,6 +80,12 @@ N8N_WEBHOOK_URL=http://n8n.zeabur.internal:5678/webhook/alpaca-trades
 PORT=8080
 ACCOUNTS=acc1,acc2
 
+# Retry / stagger tuning (optional)
+WEBHOOK_MAX_RETRIES=3
+WEBHOOK_RETRY_BASE_S=1.0
+WEBHOOK_TIMEOUT_S=5.0
+WEBHOOK_MIN_INTERVAL_S=0.25
+
 ACC1_KEY=PKXXXXXXXXXXXXXXXXXX
 ACC1_SECRET=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
 ACC1_LABEL=Main Account Paper
@@ -84,6 +96,29 @@ ACC2_SECRET=yyyyyyyyyyyyyyyyyyyyyyyyyyyyyy
 ACC2_LABEL=Live Account
 ACC2_IS_PAPER=false
 ```
+
+---
+
+## Retry & Stagger Behaviour
+
+### Retry with Exponential Backoff
+
+Every webhook POST is attempted up to `WEBHOOK_MAX_RETRIES` times. Both network exceptions and non-200 HTTP responses trigger a retry. The sleep between attempts follows:
+
+```
+backoff = WEBHOOK_RETRY_BASE_S × 2^(attempt - 1)
+```
+
+With the default 1 s base: **1 s → 2 s → 4 s** before giving up.
+
+If all retries are exhausted the full event payload is logged at `ERROR` level so it remains visible in your Zeabur or n8n log stream.
+
+### Staggered Calls
+
+Two mechanisms prevent burst flooding — particularly relevant when bracket/OCO orders fire several fill events in rapid succession:
+
+- **Per-account `asyncio.Lock`** — serialises concurrent coroutines for the same account so they queue rather than pile on.
+- **`WEBHOOK_MIN_INTERVAL_S`** — enforces a minimum wall-clock gap between consecutive POSTs for the same account.
 
 ---
 
@@ -124,6 +159,18 @@ Each trade update event sends a POST request with this JSON body:
 | `expired` | Order expired (time-in-force reached) |
 | `rejected` | Order rejected by exchange |
 | `replaced` | Order replace confirmed |
+
+---
+
+## Health Check
+
+`GET /` returns:
+
+```json
+{"status": "ok"}
+```
+
+No volume mount or persistent storage required.
 
 ---
 
